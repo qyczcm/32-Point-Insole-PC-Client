@@ -5,10 +5,14 @@ AA 55 压力帧。界面约每 30 ms 刷新，颜色按原始 ADC 0～4095 从�
 """
 
 import asyncio
+import csv
+import queue
 import sys
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
+from pathlib import Path
 from tkinter import ttk
 
 try:
@@ -33,6 +37,86 @@ UI_INTERVAL_MS = 30
 CELL_W = 108
 CELL_H = 68
 CELL_GAP = 6
+
+
+OUTPUT_DIR = Path(__file__).resolve().parent
+
+
+class FrameRecorder:
+    """把每一帧解析结果追加到 CSV。蓝牙回调只入队，写盘在单独线程。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queue: queue.Queue | None = None
+        self._thread: threading.Thread | None = None
+        self.path: Path | None = None
+        self.count = 0
+        self.active = False
+        self.note = ""
+
+    def start(self, directory: Path) -> Path | None:
+        self.stop()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                self.note = "上一段记录还在保存，请稍后再试"
+                return None
+        path = directory / f"insole_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        with self._lock:
+            self.path = path
+            self.count = 0
+            self.note = f"记录中 0 帧  {path.name}"
+            self._queue = queue.Queue()
+            self.active = True
+            self._thread = threading.Thread(target=self._loop, args=(path, self._queue), daemon=True)
+            self._thread.start()
+        print(f"开始记录 {path}", flush=True)
+        return path
+
+    def add(self, stamp: str, values: list[int]) -> None:
+        with self._lock:
+            if not self.active or self._queue is None:
+                return
+            self._queue.put((stamp, values))
+            self.count += 1
+
+    def stop(self) -> None:
+        with self._lock:
+            if not self.active:
+                return
+            self.active = False
+            pending = self._queue
+            if self.count:
+                self.note = f"正在保存 {self.count} 帧..."
+        if pending is not None:
+            pending.put(None)
+
+    def _loop(self, path: Path, pending: queue.Queue) -> None:
+        saved = 0
+        try:
+            with path.open("w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["时间", *[f"ch{index:02d}" for index in range(32)]])
+                last_flush = time.monotonic()
+                while True:
+                    item = pending.get()
+                    if item is None:
+                        break
+                    stamp, values = item
+                    writer.writerow([stamp, *values])
+                    saved += 1
+                    now = time.monotonic()
+                    if now - last_flush >= 1.0:
+                        handle.flush()
+                        last_flush = now
+                handle.flush()
+            self.count = saved
+            self.note = f"已保存 {saved} 帧  {path.name}"
+        except Exception as exc:
+            self.active = False
+            self.note = f"记录失败：{exc}"
+        print(self.note, flush=True)
 
 
 def cell_colors(value: int | None) -> tuple[str, str]:
@@ -72,6 +156,9 @@ class InsoleView(tk.Tk):
         self._status_shown = ""
         self._summary_shown = ""
         self._buttons_live: bool | None = None
+        self._record_btn_shown: tuple[str, str] | None = None
+        self.connected = False
+        self.recorder = FrameRecorder()
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(UI_INTERVAL_MS, self._refresh)
@@ -86,6 +173,8 @@ class InsoleView(tk.Tk):
         self.connect_btn.pack(side="left")
         self.disconnect_btn = ttk.Button(top, text="断开", command=self._disconnect, state="disabled")
         self.disconnect_btn.pack(side="left", padx=(6, 0))
+        self.record_btn = ttk.Button(top, text="记录", command=self._toggle_record, state="disabled")
+        self.record_btn.pack(side="left", padx=(6, 0))
 
         self.status = tk.Label(self, text=self.status_text, anchor="w", bg="#f7f7f7", fg="#333333")
         self.status.pack(fill="x", padx=12, pady=(0, 8))
@@ -142,10 +231,23 @@ class InsoleView(tk.Tk):
         self.worker.start()
 
     def _disconnect(self) -> None:
+        self.recorder.stop()
         self.stop_flag.set()
         self._set_status("正在断开...")
 
+    def _toggle_record(self) -> None:
+        if self.recorder.active:
+            self.recorder.stop()
+            return
+        if not self.connected:
+            return
+        self.recorder.start(OUTPUT_DIR)
+
     def _on_close(self) -> None:
+        self.recorder.stop()
+        thread = self.recorder._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
         self.stop_flag.set()
         self.destroy()
 
@@ -186,7 +288,8 @@ class InsoleView(tk.Tk):
                 if not xor_ok(raw):
                     self.xor_fail += 1
                     return
-                self.values = parse_frame(raw)
+                parsed = parse_frame(raw)
+                self.values = parsed
                 self.frame_total += 1
                 self._rate_count += 1
                 elapsed = now - self._rate_started
@@ -194,10 +297,14 @@ class InsoleView(tk.Tk):
                     self.fps = self._rate_count / elapsed
                     self._rate_count = 0
                     self._rate_started = now
-                return
+            else:
+                parsed = None
             if len(raw) >= 7 and raw[:2] == STATUS_HEADER:
                 self.battery = raw[4]
                 self.charging = raw[6]
+        if parsed is not None:
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            self.recorder.add(stamp, parsed)
 
     async def _ble_main(self, keyword: str) -> None:
         match = await self._find_device(keyword)
@@ -222,11 +329,15 @@ class InsoleView(tk.Tk):
                     self._rate_started = time.monotonic()
                     self.fps = 0.0
                 await client.start_notify(NOTIFY_UUID, lambda _sender, data: self._on_notify(data))
+                self.connected = True
                 while not self.stop_flag.is_set():
                     await asyncio.sleep(0.05)
                 await client.stop_notify(NOTIFY_UUID)
         except BleakError as exc:
             self._set_status(f"蓝牙失败：{exc}")
+        finally:
+            self.connected = False
+            self.recorder.stop()
         if self.stop_flag.is_set():
             self._set_status("已断开")
 
@@ -240,6 +351,10 @@ class InsoleView(tk.Tk):
             xor_fail = self.xor_fail
             battery = self.battery
             charging = self.charging
+            recording = self.recorder.active
+            recorded = self.recorder.count
+            record_note = self.recorder.note
+            connected = self.connected
 
         if status != self._status_shown:
             self._status_shown = status
@@ -267,6 +382,10 @@ class InsoleView(tk.Tk):
             )
         if battery is not None:
             summary += f"    电量 {battery} {'充电' if charging else '未充电'}"
+        if recording:
+            summary += f"    记录 {recorded} 帧"
+        elif record_note:
+            summary += f"    {record_note}"
         if summary != self._summary_shown:
             self._summary_shown = summary
             self.summary.configure(text=summary)
@@ -275,6 +394,15 @@ class InsoleView(tk.Tk):
             self._buttons_live = alive
             self.connect_btn.configure(state="disabled" if alive else "normal")
             self.disconnect_btn.configure(state="normal" if alive else "disabled")
+        if connected and recording:
+            record_shown = ("normal", "停止")
+        elif connected:
+            record_shown = ("normal", "记录")
+        else:
+            record_shown = ("disabled", "记录")
+        if record_shown != self._record_btn_shown:
+            self._record_btn_shown = record_shown
+            self.record_btn.configure(state=record_shown[0], text=record_shown[1])
         self.after(UI_INTERVAL_MS, self._refresh)
 
 
