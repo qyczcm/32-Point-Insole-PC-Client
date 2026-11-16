@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tkinter import ttk
@@ -37,9 +38,28 @@ UI_INTERVAL_MS = 30
 CELL_W = 108
 CELL_H = 68
 CELL_GAP = 6
+ESTIMATE_WINDOW_S = 0.5
+
+# 32点体重估算算法.md：16:20 记录开头稳住段的通道底数，以及求和直线。
+BASELINE = (
+    213.59, 212.06, 341.59, 198.18, 194.59, 308.47, 266.29, 302.06,
+    345.41, 485.47, 495.06, 737.76, 371.94, 494.00, 254.88, 323.29,
+    344.76, 422.59, 482.82, 370.35, 698.88, 263.41, 340.71, 334.71,
+    341.71, 216.59, 250.82, 211.71, 214.18, 285.35, 387.00, 280.76,
+)
+WEIGHT_OFFSET = 7.71775113
+WEIGHT_SLOPE = 0.0020219980
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent
+
+
+def estimate_weight(channels: list[float]) -> float:
+    """半秒平均后的 32 点，减去底数再求和，换算成千克。"""
+    excess = 0.0
+    for value, base in zip(channels, BASELINE):
+        excess += max(0.0, value - base)
+    return WEIGHT_OFFSET + WEIGHT_SLOPE * excess
 
 
 class FrameRecorder:
@@ -141,6 +161,8 @@ class InsoleView(tk.Tk):
         self.stop_flag = threading.Event()
         self.worker: threading.Thread | None = None
         self.values: list[int] | None = None
+        self._estimate_frames: deque[tuple[float, list[int]]] = deque()
+        self.estimate_kg: float | None = None
         self.fps = 0.0
         self.frame_total = 0
         self.xor_fail = 0
@@ -154,6 +176,7 @@ class InsoleView(tk.Tk):
         self._cells: list[tuple[int, int, int]] = []
         self._shown: list[tuple[int | None, bool]] = [(None, False)] * 32
         self._status_shown = ""
+        self._weight_shown = ""
         self._summary_shown = ""
         self._buttons_live: bool | None = None
         self._record_btn_shown: tuple[str, str] | None = None
@@ -177,7 +200,18 @@ class InsoleView(tk.Tk):
         self.record_btn.pack(side="left", padx=(6, 0))
 
         self.status = tk.Label(self, text=self.status_text, anchor="w", bg="#f7f7f7", fg="#333333")
-        self.status.pack(fill="x", padx=12, pady=(0, 8))
+        self.status.pack(fill="x", padx=12, pady=(0, 4))
+
+        meter = tk.Frame(self, bg="#f7f7f7")
+        meter.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(
+            meter, text="估算重量", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)
+        ).pack(side="left")
+        self.weight_label = tk.Label(
+            meter, text="--", bg="#f7f7f7", fg="#1c1c1c", font=("Consolas", 28, "bold")
+        )
+        self.weight_label.pack(side="left", padx=(12, 6))
+        tk.Label(meter, text="kg", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)).pack(side="left")
 
         width = 8 * CELL_W + 7 * CELL_GAP
         height = 4 * CELL_H + 3 * CELL_GAP
@@ -290,6 +324,16 @@ class InsoleView(tk.Tk):
                     return
                 parsed = parse_frame(raw)
                 self.values = parsed
+                self._estimate_frames.append((now, parsed))
+                cutoff = now - ESTIMATE_WINDOW_S
+                while self._estimate_frames and self._estimate_frames[0][0] < cutoff:
+                    self._estimate_frames.popleft()
+                count = len(self._estimate_frames)
+                means = [0.0] * 32
+                for _stamp, frame in self._estimate_frames:
+                    for index, value in enumerate(frame):
+                        means[index] += value
+                self.estimate_kg = estimate_weight([value / count for value in means])
                 self.frame_total += 1
                 self._rate_count += 1
                 elapsed = now - self._rate_started
@@ -328,6 +372,9 @@ class InsoleView(tk.Tk):
                     self._rate_count = 0
                     self._rate_started = time.monotonic()
                     self.fps = 0.0
+                    self.values = None
+                    self._estimate_frames.clear()
+                    self.estimate_kg = None
                 await client.start_notify(NOTIFY_UUID, lambda _sender, data: self._on_notify(data))
                 self.connected = True
                 while not self.stop_flag.is_set():
@@ -351,6 +398,7 @@ class InsoleView(tk.Tk):
             xor_fail = self.xor_fail
             battery = self.battery
             charging = self.charging
+            estimate_kg = self.estimate_kg
             recording = self.recorder.active
             recorded = self.recorder.count
             record_note = self.recorder.note
@@ -359,6 +407,10 @@ class InsoleView(tk.Tk):
         if status != self._status_shown:
             self._status_shown = status
             self.status.configure(text=status)
+        shown_weight = "--" if estimate_kg is None else f"{estimate_kg:.1f}"
+        if shown_weight != self._weight_shown:
+            self._weight_shown = shown_weight
+            self.weight_label.configure(text=shown_weight)
         peak = None
         if values:
             peak = max(range(32), key=values.__getitem__)
