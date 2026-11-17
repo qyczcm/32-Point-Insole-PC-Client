@@ -40,26 +40,33 @@ CELL_H = 68
 CELL_GAP = 6
 ESTIMATE_WINDOW_S = 0.5
 
-# 32点体重估算算法.md：16:20 记录开头稳住段的通道底数，以及求和直线。
+# 2026-11-17 上午三次直接放在秤上的记录一起拟合。空载底数取第一次开头的空放段。
+# 各点系数不小于 0。
 BASELINE = (
-    213.59, 212.06, 341.59, 198.18, 194.59, 308.47, 266.29, 302.06,
-    345.41, 485.47, 495.06, 737.76, 371.94, 494.00, 254.88, 323.29,
-    344.76, 422.59, 482.82, 370.35, 698.88, 263.41, 340.71, 334.71,
-    341.71, 216.59, 250.82, 211.71, 214.18, 285.35, 387.00, 280.76,
+    207.66, 197.03, 196.50, 198.59, 199.97, 198.53, 202.41, 201.97,
+    197.47, 199.00, 201.66, 196.69, 197.19, 197.31, 207.06, 196.22,
+    205.78, 205.94, 196.91, 198.62, 195.97, 197.44, 196.97, 196.78,
+    203.38, 203.66, 198.00, 209.38, 200.38, 197.12, 198.97, 193.41,
 )
-WEIGHT_OFFSET = 7.71775113
-WEIGHT_SLOPE = 0.0020219980
+CHANNEL_GAINS = (
+    0.0035096618, 0.0, 0.0, 0.0, 0.0, 0.0139557928, 0.0, 0.0,
+    0.0006424328, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0030167519, 0.0, 0.0218251896, 0.0060995795, 0.0, 0.0, 0.0011305142,
+    0.0, 0.0038674507, 0.0031887420, 0.0, 0.0, 0.0024911169, 0.0, 0.0,
+)
+WEIGHT_INTERCEPT = -0.08923090
 
 
-OUTPUT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = Path(__file__).resolve().parent / "data"
 
 
 def estimate_weight(channels: list[float]) -> float:
-    """半秒平均后的 32 点，减去底数再求和，换算成千克。"""
-    excess = 0.0
-    for value, base in zip(channels, BASELINE):
-        excess += max(0.0, value - base)
-    return WEIGHT_OFFSET + WEIGHT_SLOPE * excess
+    """半秒平均后的 32 点，各点高出空载的部分按三次标定得到的非负灵敏度相加。"""
+    estimate = WEIGHT_INTERCEPT
+    for value, base, gain in zip(channels, BASELINE, CHANNEL_GAINS):
+        if gain:
+            estimate += gain * max(0.0, value - base)
+    return estimate
 
 
 class FrameRecorder:
@@ -82,6 +89,7 @@ class FrameRecorder:
             if thread.is_alive():
                 self.note = "上一段记录还在保存，请稍后再试"
                 return None
+        directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"insole_{datetime.now():%Y%m%d_%H%M%S}.csv"
         with self._lock:
             self.path = path

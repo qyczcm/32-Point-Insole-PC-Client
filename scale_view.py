@@ -22,7 +22,7 @@ except ImportError:
     print("缺少 pyserial。请先执行: pip install pyserial", file=sys.stderr)
     raise SystemExit(1)
 
-OUTPUT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = Path(__file__).resolve().parent / "data"
 BAUDRATES = ["9600", "4800", "19200", "38400", "57600", "115200"]
 UI_INTERVAL_MS = 100
 
@@ -56,6 +56,7 @@ class WeightRecorder:
             if thread.is_alive():
                 self.note = "上一段记录还在保存，请稍后再试"
                 return None
+        directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"scale_{datetime.now():%Y%m%d_%H%M%S}.csv"
         with self._lock:
             self.path = path
