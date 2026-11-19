@@ -85,8 +85,15 @@ FOOT_POINTS = (
 )
 FOOT_OUTLINE = (28, 26, 24, 22, 20, 19, 17, 1, 2, 4, 5, 6, 8, 9, 10, 11, 13, 15, 32, 30, 29)
 
-# 鞋垫直接放在秤上、重量 14～45 kg 的稳住读数拟合。空载底数取第一次近 0 kg 段。
-# 各点系数不小于 0。
+# 五个区域。点号是装配图蓝色编号，通道序号是点号减 1。
+REGIONS = (
+    ("脚尖", (26, 27, 28, 29)),
+    ("前掌内", (20, 21, 22, 23, 24, 25)),
+    ("前掌外", (13, 14, 15, 16, 30, 31, 32)),
+    ("足弓", (9, 10, 11, 12, 17, 18, 19)),
+    ("脚跟", (1, 2, 3, 4, 5, 6, 7, 8)),
+)
+# 鞋垫直接放在秤上、14～45 kg 稳住样本，按上面五个区里的点做非负拟合。空载底数取第一次近 0 kg 段。
 BASELINE = (
     210.47, 198.21, 199.51, 196.92, 196.70, 198.88, 200.01, 196.39,
     194.87, 198.14, 201.04, 195.57, 200.31, 197.70, 201.01, 204.12,
@@ -94,24 +101,34 @@ BASELINE = (
     206.29, 204.88, 198.10, 203.30, 199.12, 196.08, 199.18, 195.37,
 )
 CHANNEL_GAINS = (
-    0.0036213713, 0.0, 0.0, 0.0, 0.0, 0.0037965454, 0.0, 0.0,
-    0.0275087137, 0.0013028275, 0.0040982934, 0.0, 0.0016723030, 0.0, 0.0015715958, 0.0,
-    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0018364278,
-    0.0, 0.0, 0.0320628809, 0.0, 0.0, 0.0, 0.0023517643, 0.0,
+    0.0022434934, 0.0, 0.0, 0.0, 0.0, 0.0072407993, 0.0009621994, 0.0,
+    0.0048243232, 0.0, 0.0, 0.0, 0.0064035806, 0.0, 0.0, 0.0,
+    0.0, 0.0023829758, 0.0, 0.0052357255, 0.0086121657, 0.0, 0.0, 0.0047295760,
+    0.0, 0.0, 0.0095982758, 0.0, 0.0, 0.0024642233, 0.0013027092, 0.0,
 )
-WEIGHT_INTERCEPT = -0.04406593
+WEIGHT_INTERCEPT = -0.11061102
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "data"
 
 
+def region_loads(channels: list[float]) -> list[float]:
+    """每个区的负荷：区内各点高出空载的部分乘以该点的非负灵敏度。"""
+    loads = []
+    for _name, members in REGIONS:
+        load = 0.0
+        for number in members:
+            index = number - 1
+            gain = CHANNEL_GAINS[index]
+            if gain:
+                load += gain * max(0.0, channels[index] - BASELINE[index])
+        loads.append(load)
+    return loads
+
+
 def estimate_weight(channels: list[float]) -> float:
-    """半秒平均后的 32 点，各点高出空载的部分按 14～45 kg 标定的非负灵敏度相加。"""
-    estimate = WEIGHT_INTERCEPT
-    for value, base, gain in zip(channels, BASELINE, CHANNEL_GAINS):
-        if gain:
-            estimate += gain * max(0.0, value - base)
-    return estimate
+    """半秒平均后，五个区的负荷相加，再加标定常数。"""
+    return WEIGHT_INTERCEPT + sum(region_loads(channels))
 
 
 class FrameRecorder:
@@ -302,6 +319,7 @@ class InsoleView(tk.Tk):
         self.values: list[int] | None = None
         self._estimate_frames: deque[tuple[float, list[int]]] = deque()
         self.estimate_kg: float | None = None
+        self.region_kg: list[float] | None = None
         self.fps = 0.0
         self.frame_total = 0
         self.xor_fail = 0
@@ -316,6 +334,7 @@ class InsoleView(tk.Tk):
         self._shown: list[tuple[int | None, bool]] = [(None, False)] * 32
         self._status_shown = ""
         self._weight_shown = ""
+        self._region_shown = ""
         self._summary_shown = ""
         self._buttons_live: bool | None = None
         self._record_btn_shown: tuple[str, str] | None = None
@@ -384,6 +403,12 @@ class InsoleView(tk.Tk):
         )
         self.weight_label.pack(side="left")
         tk.Label(meter, text="kg", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)).pack(side="left", padx=(6, 0))
+        self.region_label = tk.Label(
+            side,
+            text="\n".join(f"{name} --" for name, _members in REGIONS),
+            anchor="w", justify="left", bg="#f7f7f7", fg="#333333",
+        )
+        self.region_label.pack(anchor="w", pady=(0, 8))
 
         tk.Label(side, text="脚尖在上", bg="#f7f7f7", fg="#888888").pack(anchor="w", pady=(8, 0))
         self.summary = tk.Label(
@@ -688,7 +713,9 @@ class InsoleView(tk.Tk):
                 for _stamp, frame in self._estimate_frames:
                     for index, value in enumerate(frame):
                         means[index] += value
-                self.estimate_kg = estimate_weight([value / count for value in means])
+                averaged = [value / count for value in means]
+                self.region_kg = region_loads(averaged)
+                self.estimate_kg = WEIGHT_INTERCEPT + sum(self.region_kg)
                 self.frame_total += 1
                 self._rate_count += 1
                 elapsed = now - self._rate_started
@@ -730,6 +757,7 @@ class InsoleView(tk.Tk):
                     self.values = None
                     self._estimate_frames.clear()
                     self.estimate_kg = None
+                    self.region_kg = None
                 await client.start_notify(NOTIFY_UUID, lambda _sender, data: self._on_notify(data))
                 self.connected = True
                 while not self.stop_flag.is_set():
@@ -754,6 +782,7 @@ class InsoleView(tk.Tk):
             battery = self.battery
             charging = self.charging
             estimate_kg = self.estimate_kg
+            region_kg = None if self.region_kg is None else list(self.region_kg)
             recording = self.recorder.active
             recorded = self.recorder.count
             record_note = self.recorder.note
@@ -766,6 +795,15 @@ class InsoleView(tk.Tk):
         if shown_weight != self._weight_shown:
             self._weight_shown = shown_weight
             self.weight_label.configure(text=shown_weight)
+        if region_kg is None:
+            region_text = "\n".join(f"{name} --" for name, _members in REGIONS)
+        else:
+            region_text = "\n".join(
+                f"{name} {load:.1f}" for (name, _members), load in zip(REGIONS, region_kg)
+            )
+        if region_text != self._region_shown:
+            self._region_shown = region_text
+            self.region_label.configure(text=region_text)
         peak = None
         if values:
             peak = max(range(32), key=values.__getitem__)
