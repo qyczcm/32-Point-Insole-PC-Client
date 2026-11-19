@@ -23,6 +23,15 @@ except ImportError:
     print("缺少 bleak。请先执行: pip install bleak", file=sys.stderr)
     raise SystemExit(1)
 
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:
+    serial = None
+    list_ports = None
+
+BAUDRATES = ("9600", "4800", "19200", "38400", "57600", "115200")
+
 from insole_ble_print import (
     FRAME_HEADER,
     FRAME_LEN,
@@ -76,28 +85,28 @@ FOOT_POINTS = (
 )
 FOOT_OUTLINE = (21, 23, 25, 27, 29, 30, 32, 1, 2, 4, 5, 6, 8, 9, 10, 11, 13, 15, 17, 19, 20)
 
-# 2026-11-17 上午三次直接放在秤上的记录一起拟合。空载底数取第一次开头的空放段。
+# 鞋垫直接放在秤上、重量 14～45 kg 的稳住读数拟合。空载底数取第一次近 0 kg 段。
 # 各点系数不小于 0。
 BASELINE = (
-    207.66, 197.03, 196.50, 198.59, 199.97, 198.53, 202.41, 201.97,
-    197.47, 199.00, 201.66, 196.69, 197.19, 197.31, 207.06, 196.22,
-    205.78, 205.94, 196.91, 198.62, 195.97, 197.44, 196.97, 196.78,
-    203.38, 203.66, 198.00, 209.38, 200.38, 197.12, 198.97, 193.41,
+    210.47, 198.21, 199.51, 196.92, 196.70, 198.88, 200.01, 196.39,
+    194.87, 198.14, 201.04, 195.57, 200.31, 197.70, 201.01, 204.12,
+    202.45, 198.74, 197.77, 197.03, 192.71, 204.28, 203.22, 199.81,
+    206.29, 204.88, 198.10, 203.30, 199.12, 196.08, 199.18, 195.37,
 )
 CHANNEL_GAINS = (
-    0.0035096618, 0.0, 0.0, 0.0, 0.0, 0.0139557928, 0.0, 0.0,
-    0.0006424328, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    0.0, 0.0030167519, 0.0, 0.0218251896, 0.0060995795, 0.0, 0.0, 0.0011305142,
-    0.0, 0.0038674507, 0.0031887420, 0.0, 0.0, 0.0024911169, 0.0, 0.0,
+    0.0036213713, 0.0, 0.0, 0.0, 0.0, 0.0037965454, 0.0, 0.0,
+    0.0275087137, 0.0013028275, 0.0040982934, 0.0, 0.0016723030, 0.0, 0.0015715958, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0018364278,
+    0.0, 0.0, 0.0320628809, 0.0, 0.0, 0.0, 0.0023517643, 0.0,
 )
-WEIGHT_INTERCEPT = -0.08923090
+WEIGHT_INTERCEPT = -0.04406593
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "data"
 
 
 def estimate_weight(channels: list[float]) -> float:
-    """半秒平均后的 32 点，各点高出空载的部分按三次标定得到的非负灵敏度相加。"""
+    """半秒平均后的 32 点，各点高出空载的部分按 14～45 kg 标定的非负灵敏度相加。"""
     estimate = WEIGHT_INTERCEPT
     for value, base, gain in zip(channels, BASELINE, CHANNEL_GAINS):
         if gain:
@@ -183,6 +192,92 @@ class FrameRecorder:
         print(self.note, flush=True)
 
 
+def parse_weight_line(raw: bytes) -> float | None:
+    text = raw.decode("ascii", errors="ignore").strip()
+    if not text:
+        return None
+    try:
+        return float(text.split(",", 1)[0].strip())
+    except ValueError:
+        return None
+
+
+class WeightRecorder:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queue: queue.Queue | None = None
+        self._thread: threading.Thread | None = None
+        self.path: Path | None = None
+        self.count = 0
+        self.active = False
+        self.note = ""
+
+    def start(self, directory: Path) -> Path | None:
+        self.stop()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                self.note = "上一段记录还在保存，请稍后再试"
+                return None
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"scale_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        with self._lock:
+            self.path = path
+            self.count = 0
+            self.note = f"记录中 0 条  {path.name}"
+            self._queue = queue.Queue()
+            self.active = True
+            self._thread = threading.Thread(target=self._loop, args=(path, self._queue), daemon=True)
+            self._thread.start()
+        print(f"开始记录 {path}", flush=True)
+        return path
+
+    def add(self, stamp: str, weight: float) -> None:
+        with self._lock:
+            if not self.active or self._queue is None:
+                return
+            self._queue.put((stamp, weight))
+            self.count += 1
+
+    def stop(self) -> None:
+        with self._lock:
+            if not self.active:
+                return
+            self.active = False
+            pending = self._queue
+            if self.count:
+                self.note = f"正在保存 {self.count} 条..."
+        if pending is not None:
+            pending.put(None)
+
+    def _loop(self, path: Path, pending: queue.Queue) -> None:
+        saved = 0
+        try:
+            with path.open("w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["时间", "重量kg"])
+                last_flush = time.monotonic()
+                while True:
+                    item = pending.get()
+                    if item is None:
+                        break
+                    stamp, weight = item
+                    writer.writerow([stamp, f"{weight:.3f}"])
+                    saved += 1
+                    now = time.monotonic()
+                    if now - last_flush >= 1.0:
+                        handle.flush()
+                        last_flush = now
+                handle.flush()
+            self.count = saved
+            self.note = f"已保存 {saved} 条  {path.name}"
+        except Exception as exc:
+            self.active = False
+            self.note = f"记录失败：{exc}"
+        print(self.note, flush=True)
+
+
 def cell_colors(value: int | None) -> tuple[str, str]:
     if value is None:
         return "#f3f3f3", "#9a9a9a"
@@ -197,7 +292,7 @@ def cell_colors(value: int | None) -> tuple[str, str]:
 class InsoleView(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("32点鞋垫")
+        self.title("32点鞋垫 / 体重秤")
         self.resizable(False, False)
         self.configure(bg="#f7f7f7")
 
@@ -226,7 +321,29 @@ class InsoleView(tk.Tk):
         self._record_btn_shown: tuple[str, str] | None = None
         self.connected = False
         self.recorder = FrameRecorder()
+
+        self.scale_lock = threading.Lock()
+        self.scale_stop = threading.Event()
+        self.scale_worker: threading.Thread | None = None
+        self.scale_conn = None
+        self.scale_connected = False
+        self._scale_closed = False
+        self.scale_weight: float | None = None
+        self.scale_raw = ""
+        self.scale_count = 0
+        self.scale_status = "未连接" if serial is not None else "缺少 pyserial"
+        self.scale_recorder = WeightRecorder()
+        self._scale_status_shown = ""
+        self._scale_weight_shown = ""
+        self._scale_raw_shown = ""
+        self._scale_summary_shown = ""
+        self._scale_record_shown: tuple[str, str] | None = None
+        self.port_var = tk.StringVar()
+        self.baud_var = tk.StringVar(value="9600")
+        self._ports: dict[str, str] = {}
+
         self._build()
+        self._refresh_ports()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(UI_INTERVAL_MS, self._refresh)
         self.after(200, self._connect)
@@ -281,7 +398,6 @@ class InsoleView(tk.Tk):
         self.canvas = tk.Canvas(
             body, width=width, height=height, bg="#f7f7f7", highlightthickness=0, bd=0,
         )
-        self.canvas.pack(side="left", padx=(8, 12), pady=12)
 
         center_x = sum(px for px, _py in points.values()) / len(points)
         center_y = sum(py for _px, py in points.values()) / len(points)
@@ -309,6 +425,60 @@ class InsoleView(tk.Tk):
             )
             placed[number - 1] = (oval, name, value)
         self._cells = placed
+
+        scale = tk.Frame(body, bg="#f7f7f7", width=268)
+        scale.pack(side="right", fill="y", padx=(0, 12), pady=12)
+        scale.pack_propagate(False)
+        self.canvas.pack(side="left", padx=(8, 8), pady=12)
+        tk.Label(scale, text="体重秤", bg="#f7f7f7", font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+
+        port_row = tk.Frame(scale, bg="#f7f7f7")
+        port_row.pack(fill="x", pady=(10, 4))
+        tk.Label(port_row, text="串口", bg="#f7f7f7").pack(side="left")
+        self.port_combo = ttk.Combobox(port_row, textvariable=self.port_var, width=22, state="readonly")
+        self.port_combo.pack(side="left", padx=(6, 0))
+        ttk.Button(scale, text="刷新串口", command=self._refresh_ports).pack(anchor="w", pady=(0, 6))
+
+        baud_row = tk.Frame(scale, bg="#f7f7f7")
+        baud_row.pack(fill="x", pady=(0, 8))
+        tk.Label(baud_row, text="波特率", bg="#f7f7f7").pack(side="left")
+        self.baud_combo = ttk.Combobox(
+            baud_row, textvariable=self.baud_var, width=8, values=BAUDRATES, state="readonly"
+        )
+        self.baud_combo.pack(side="left", padx=(6, 0))
+
+        scale_buttons = tk.Frame(scale, bg="#f7f7f7")
+        scale_buttons.pack(anchor="w")
+        self.scale_open_btn = ttk.Button(scale_buttons, text="打开", command=self._scale_open)
+        self.scale_open_btn.pack(side="left")
+        self.scale_close_btn = ttk.Button(scale_buttons, text="关闭", command=self._scale_close, state="disabled")
+        self.scale_close_btn.pack(side="left", padx=(6, 0))
+        self.scale_record_btn = ttk.Button(scale_buttons, text="记录", command=self._scale_toggle_record, state="disabled")
+        self.scale_record_btn.pack(side="left", padx=(6, 0))
+        if serial is None:
+            self.scale_open_btn.configure(state="disabled")
+
+        self.scale_status_label = tk.Label(
+            scale, text=self.scale_status, anchor="w", justify="left", wraplength=250,
+            bg="#f7f7f7", fg="#333333",
+        )
+        self.scale_status_label.pack(fill="x", pady=(10, 8))
+        tk.Label(scale, text="秤上重量", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)).pack(anchor="w")
+        scale_meter = tk.Frame(scale, bg="#f7f7f7")
+        scale_meter.pack(anchor="w", pady=(2, 6))
+        self.scale_weight_label = tk.Label(
+            scale_meter, text="--", bg="#f7f7f7", fg="#1c1c1c", font=("Consolas", 28, "bold")
+        )
+        self.scale_weight_label.pack(side="left")
+        tk.Label(scale_meter, text="kg", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)).pack(
+            side="left", padx=(6, 0)
+        )
+        self.scale_raw_label = tk.Label(
+            scale, text="等待数据", anchor="w", bg="#f7f7f7", fg="#666666", font=("Consolas", 10)
+        )
+        self.scale_raw_label.pack(fill="x", pady=(8, 0))
+        self.scale_summary = tk.Label(scale, text="采样 0", anchor="w", justify="left", bg="#f7f7f7")
+        self.scale_summary.pack(fill="x", pady=(8, 0))
 
     def _set_status(self, text: str) -> None:
         with self.lock:
@@ -338,12 +508,136 @@ class InsoleView(tk.Tk):
             return
         self.recorder.start(OUTPUT_DIR)
 
+    def _refresh_ports(self) -> None:
+        if serial is None or self.scale_connected:
+            return
+        found = list(list_ports.comports())
+        labels = []
+        mapping: dict[str, str] = {}
+        for port in found:
+            label = port.device if not port.description else f"{port.device}: {port.description}"
+            labels.append(label)
+            mapping[label] = port.device
+        self._ports = mapping
+        self.port_combo["values"] = labels
+        if self.port_var.get() not in labels:
+            self.port_var.set(labels[0] if labels else "")
+
+    def _selected_port(self) -> str:
+        label = self.port_var.get().strip()
+        return self._ports.get(label, label.split(":", 1)[0].strip())
+
+    def _set_scale_status(self, text: str) -> None:
+        with self.scale_lock:
+            self.scale_status = text
+        print(text, flush=True)
+
+    def _scale_open(self) -> None:
+        if serial is None or (self.scale_worker and self.scale_worker.is_alive()):
+            return
+        port = self._selected_port()
+        if not port:
+            self._set_scale_status("没有可用串口")
+            return
+        try:
+            baud = int(self.baud_var.get())
+        except ValueError:
+            self._set_scale_status("波特率无效")
+            return
+        try:
+            conn = serial.Serial(
+                port=port,
+                baudrate=baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.2,
+            )
+            conn.dtr = True
+            conn.rts = False
+        except Exception as exc:
+            self._set_scale_status(f"打开失败：{exc}")
+            return
+        self.scale_conn = conn
+        self.scale_stop.clear()
+        with self.scale_lock:
+            self.scale_count = 0
+            self.scale_weight = None
+            self.scale_raw = ""
+        self.scale_connected = True
+        self.scale_open_btn.configure(state="disabled")
+        self.scale_close_btn.configure(state="normal")
+        self.port_combo.configure(state="disabled")
+        self.baud_combo.configure(state="disabled")
+        self._set_scale_status(f"已打开 {port}  {baud} 8N1")
+        self.scale_worker = threading.Thread(target=self._scale_read_loop, daemon=True)
+        self.scale_worker.start()
+
+    def _scale_close(self) -> None:
+        self.scale_recorder.stop()
+        self.scale_stop.set()
+        self._set_scale_status("正在关闭...")
+
+    def _scale_toggle_record(self) -> None:
+        if self.scale_recorder.active:
+            self.scale_recorder.stop()
+            return
+        if not self.scale_connected:
+            return
+        self.scale_recorder.start(OUTPUT_DIR)
+
+    def _scale_read_loop(self) -> None:
+        conn = self.scale_conn
+        try:
+            while conn is not None and not self.scale_stop.is_set():
+                raw = conn.readline()
+                if not raw:
+                    continue
+                text = raw.decode("ascii", errors="ignore").strip()
+                weight = parse_weight_line(raw)
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                with self.scale_lock:
+                    self.scale_raw = text
+                    if weight is not None:
+                        self.scale_weight = weight
+                        self.scale_count += 1
+                if weight is not None:
+                    self.scale_recorder.add(stamp, weight)
+        except Exception as exc:
+            if not self.scale_stop.is_set():
+                self._set_scale_status(f"串口中断：{exc}")
+        finally:
+            conn = self.scale_conn
+            self.scale_conn = None
+            if conn is not None:
+                try:
+                    if conn.is_open:
+                        conn.close()
+                except Exception:
+                    pass
+            self.scale_connected = False
+            self.scale_recorder.stop()
+            self._scale_closed = True
+            if self.scale_stop.is_set():
+                self._set_scale_status("已关闭")
+
     def _on_close(self) -> None:
         self.recorder.stop()
         thread = self.recorder._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
+        self.scale_recorder.stop()
+        scale_thread = self.scale_recorder._thread
+        if scale_thread is not None and scale_thread.is_alive():
+            scale_thread.join(timeout=2.0)
         self.stop_flag.set()
+        self.scale_stop.set()
+        conn = self.scale_conn
+        if conn is not None and conn.is_open:
+            try:
+                conn.close()
+            except Exception:
+                pass
         self.destroy()
 
     def _ble_thread(self, keyword: str) -> None:
@@ -516,6 +810,49 @@ class InsoleView(tk.Tk):
         if record_shown != self._record_btn_shown:
             self._record_btn_shown = record_shown
             self.record_btn.configure(state=record_shown[0], text=record_shown[1])
+
+        with self.scale_lock:
+            scale_status = self.scale_status
+            scale_weight = self.scale_weight
+            scale_raw = self.scale_raw
+            scale_count = self.scale_count
+        scale_recording = self.scale_recorder.active
+        scale_recorded = self.scale_recorder.count
+        scale_note = self.scale_recorder.note
+        if scale_status != self._scale_status_shown:
+            self._scale_status_shown = scale_status
+            self.scale_status_label.configure(text=scale_status)
+        shown_scale = "--" if scale_weight is None else f"{scale_weight:.3f}"
+        if shown_scale != self._scale_weight_shown:
+            self._scale_weight_shown = shown_scale
+            self.scale_weight_label.configure(text=shown_scale)
+        shown_raw = scale_raw or "等待数据"
+        if shown_raw != self._scale_raw_shown:
+            self._scale_raw_shown = shown_raw
+            self.scale_raw_label.configure(text=shown_raw)
+        scale_summary = f"采样 {scale_count}"
+        if scale_recording:
+            scale_summary += f"\n记录 {scale_recorded} 条"
+        elif scale_note:
+            scale_summary += f"\n{scale_note}"
+        if scale_summary != self._scale_summary_shown:
+            self._scale_summary_shown = scale_summary
+            self.scale_summary.configure(text=scale_summary)
+        if self._scale_closed:
+            self._scale_closed = False
+            self.scale_open_btn.configure(state="normal" if serial is not None else "disabled")
+            self.scale_close_btn.configure(state="disabled")
+            self.port_combo.configure(state="readonly")
+            self.baud_combo.configure(state="readonly")
+        if self.scale_connected and scale_recording:
+            scale_record_shown = ("normal", "停止")
+        elif self.scale_connected:
+            scale_record_shown = ("normal", "记录")
+        else:
+            scale_record_shown = ("disabled", "记录")
+        if scale_record_shown != self._scale_record_shown:
+            self._scale_record_shown = scale_record_shown
+            self.scale_record_btn.configure(state=scale_record_shown[0], text=scale_record_shown[1])
         self.after(UI_INTERVAL_MS, self._refresh)
 
 
