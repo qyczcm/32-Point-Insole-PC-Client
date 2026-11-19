@@ -35,10 +35,46 @@ from insole_ble_print import (
 
 SCAN_TIMEOUT = 12.0
 UI_INTERVAL_MS = 30
-CELL_W = 108
-CELL_H = 68
-CELL_GAP = 6
 ESTIMATE_WINDOW_S = 0.5
+FOOT_SCALE = 0.82
+FOOT_PAD = 36
+FOOT_RADIUS = 21
+# 装配图点号 1～32，文字中心坐标。脚尖在上，y 向下。点号减 1 是 ch 序号。
+FOOT_POINTS = (
+    (1, 77.9, 563.5),
+    (2, 76.8, 624.0),
+    (3, 134.9, 614.5),
+    (4, 110.6, 674.6),
+    (5, 175.7, 659.9),
+    (6, 191.5, 594.1),
+    (7, 134.0, 549.6),
+    (8, 191.3, 528.4),
+    (9, 198.8, 468.0),
+    (10, 208.5, 406.7),
+    (11, 224.3, 347.3),
+    (12, 163.2, 353.5),
+    (13, 233.4, 288.3),
+    (14, 174.0, 287.4),
+    (15, 237.1, 227.0),
+    (16, 175.2, 225.3),
+    (17, 226.1, 168.7),
+    (18, 167.7, 161.3),
+    (19, 205.7, 111.8),
+    (20, 166.1, 61.2),
+    (21, 110.1, 40.8),
+    (22, 125.2, 115.9),
+    (23, 67.9, 96.0),
+    (24, 111.2, 187.3),
+    (25, 55.8, 157.6),
+    (26, 113.5, 249.4),
+    (27, 54.9, 220.5),
+    (28, 117.9, 312.4),
+    (29, 56.8, 284.6),
+    (30, 61.5, 345.8),
+    (31, 137.2, 408.5),
+    (32, 66.0, 405.9),
+)
+FOOT_OUTLINE = (21, 23, 25, 27, 29, 30, 32, 1, 2, 4, 5, 6, 8, 9, 10, 11, 13, 15, 17, 19, 20)
 
 # 2026-11-17 上午三次直接放在秤上的记录一起拟合。空载底数取第一次开头的空放段。
 # 各点系数不小于 0。
@@ -195,67 +231,84 @@ class InsoleView(tk.Tk):
         self.after(UI_INTERVAL_MS, self._refresh)
         self.after(200, self._connect)
 
+    def _foot_xy(self, px: float, py: float) -> tuple[float, float]:
+        return FOOT_PAD + px * FOOT_SCALE, FOOT_PAD + py * FOOT_SCALE
+
     def _build(self) -> None:
-        top = tk.Frame(self, bg="#f7f7f7")
-        top.pack(fill="x", padx=12, pady=(12, 6))
-        tk.Label(top, text="关键字", bg="#f7f7f7").pack(side="left")
-        ttk.Entry(top, textvariable=self.keyword, width=16).pack(side="left", padx=(6, 10))
-        self.connect_btn = ttk.Button(top, text="连接", command=self._connect)
+        body = tk.Frame(self, bg="#f7f7f7")
+        body.pack(fill="both", expand=True)
+
+        side = tk.Frame(body, bg="#f7f7f7", width=236)
+        side.pack(side="left", fill="y", padx=(12, 0), pady=12)
+        side.pack_propagate(False)
+
+        tk.Label(side, text="关键字", bg="#f7f7f7").pack(anchor="w")
+        ttk.Entry(side, textvariable=self.keyword, width=16).pack(anchor="w", pady=(4, 8))
+        buttons = tk.Frame(side, bg="#f7f7f7")
+        buttons.pack(anchor="w")
+        self.connect_btn = ttk.Button(buttons, text="连接", command=self._connect)
         self.connect_btn.pack(side="left")
-        self.disconnect_btn = ttk.Button(top, text="断开", command=self._disconnect, state="disabled")
+        self.disconnect_btn = ttk.Button(buttons, text="断开", command=self._disconnect, state="disabled")
         self.disconnect_btn.pack(side="left", padx=(6, 0))
-        self.record_btn = ttk.Button(top, text="记录", command=self._toggle_record, state="disabled")
+        self.record_btn = ttk.Button(buttons, text="记录", command=self._toggle_record, state="disabled")
         self.record_btn.pack(side="left", padx=(6, 0))
 
-        self.status = tk.Label(self, text=self.status_text, anchor="w", bg="#f7f7f7", fg="#333333")
-        self.status.pack(fill="x", padx=12, pady=(0, 4))
+        self.status = tk.Label(
+            side, text=self.status_text, anchor="w", justify="left", wraplength=220,
+            bg="#f7f7f7", fg="#333333",
+        )
+        self.status.pack(fill="x", pady=(10, 8))
 
-        meter = tk.Frame(self, bg="#f7f7f7")
-        meter.pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(
-            meter, text="估算重量", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)
-        ).pack(side="left")
+        tk.Label(side, text="估算重量", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)).pack(anchor="w")
+        meter = tk.Frame(side, bg="#f7f7f7")
+        meter.pack(anchor="w", pady=(2, 8))
         self.weight_label = tk.Label(
             meter, text="--", bg="#f7f7f7", fg="#1c1c1c", font=("Consolas", 28, "bold")
         )
-        self.weight_label.pack(side="left", padx=(12, 6))
-        tk.Label(meter, text="kg", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)).pack(side="left")
+        self.weight_label.pack(side="left")
+        tk.Label(meter, text="kg", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)).pack(side="left", padx=(6, 0))
 
-        width = 8 * CELL_W + 7 * CELL_GAP
-        height = 4 * CELL_H + 3 * CELL_GAP
-        self.canvas = tk.Canvas(
-            self,
-            width=width,
-            height=height,
-            bg="#f7f7f7",
-            highlightthickness=0,
-            bd=0,
+        tk.Label(side, text="脚尖在上", bg="#f7f7f7", fg="#888888").pack(anchor="w", pady=(8, 0))
+        self.summary = tk.Label(
+            side, text="总和 --\n最大 --\n帧率 --\nXOR失败 0",
+            anchor="w", justify="left", bg="#f7f7f7",
         )
-        self.canvas.pack(padx=12, pady=4)
-        for index in range(32):
-            row, col = divmod(index, 8)
-            x = col * (CELL_W + CELL_GAP)
-            y = row * (CELL_H + CELL_GAP)
-            rect = self.canvas.create_rectangle(
-                x, y, x + CELL_W, y + CELL_H,
+        self.summary.pack(fill="x", pady=(8, 0))
+
+        points = {number: (px, py) for number, px, py in FOOT_POINTS}
+        width = int(FOOT_PAD * 2 + 274 * FOOT_SCALE)
+        height = int(FOOT_PAD * 2 + 725 * FOOT_SCALE)
+        self.canvas = tk.Canvas(
+            body, width=width, height=height, bg="#f7f7f7", highlightthickness=0, bd=0,
+        )
+        self.canvas.pack(side="left", padx=(8, 12), pady=12)
+
+        center_x = sum(px for px, _py in points.values()) / len(points)
+        center_y = sum(py for _px, py in points.values()) / len(points)
+        outline: list[float] = []
+        for number in FOOT_OUTLINE:
+            px, py = points[number]
+            dx, dy = px - center_x, py - center_y
+            norm = (dx * dx + dy * dy) ** 0.5 or 1.0
+            outline.extend(self._foot_xy(px + dx / norm * 28, py + dy / norm * 28))
+        self.canvas.create_polygon(*outline, outline="#e7b6ea", fill="#fff7fb", smooth=True, width=2)
+
+        placed = [None] * 32
+        radius = FOOT_RADIUS
+        for number, px, py in FOOT_POINTS:
+            cx, cy = self._foot_xy(px, py)
+            oval = self.canvas.create_oval(
+                cx - radius, cy - radius, cx + radius, cy + radius,
                 fill="#f3f3f3", outline="#d0d0d0", width=2,
             )
             name = self.canvas.create_text(
-                x + CELL_W / 2, y + 20,
-                text=f"ch{index:02d}",
-                font=("Microsoft YaHei UI", 9),
-                fill="#9a9a9a",
+                cx, cy - 7, text=str(number), font=("Microsoft YaHei UI", 8), fill="#9a9a9a",
             )
             value = self.canvas.create_text(
-                x + CELL_W / 2, y + 44,
-                text="--",
-                font=("Consolas", 16, "bold"),
-                fill="#9a9a9a",
+                cx, cy + 8, text="--", font=("Consolas", 8, "bold"), fill="#9a9a9a",
             )
-            self._cells.append((rect, name, value))
-
-        self.summary = tk.Label(self, text="总和 --    最大 --    帧率 --    XOR失败 0", anchor="w", bg="#f7f7f7")
-        self.summary.pack(fill="x", padx=12, pady=(8, 12))
+            placed[number - 1] = (oval, name, value)
+        self._cells = placed
 
     def _set_status(self, text: str) -> None:
         with self.lock:
@@ -434,11 +487,11 @@ class InsoleView(tk.Tk):
             self.canvas.itemconfig(label, text="--" if value is None else str(value), fill=foreground)
 
         if values is None:
-            summary = f"总和 --    最大 --    帧率 {fps:.0f}    XOR失败 {xor_fail}"
+            summary = f"总和 --\n最大 --\n帧率 {fps:.0f}\nXOR失败 {xor_fail}"
         else:
             summary = (
-                f"总和 {sum(values)}    最大 ch{peak:02d}={values[peak]}"
-                f"    帧率 {fps:.0f}    XOR失败 {xor_fail}"
+                f"总和 {sum(values)}\n最大 点{peak + 1}={values[peak]}"
+                f"\n帧率 {fps:.0f}\nXOR失败 {xor_fail}"
             )
         if battery is not None:
             summary += f"    电量 {battery} {'充电' if charging else '未充电'}"
