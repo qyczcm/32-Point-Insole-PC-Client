@@ -93,6 +93,11 @@ REGIONS = (
     ("足弓", (9, 10, 11, 12, 17, 18, 19)),
     ("脚跟", (1, 2, 3, 4, 5, 6, 7, 8)),
 )
+REGION_COLORS = ("#1d4ed8", "#6d28d9", "#c2410c", "#15803d", "#be185d")
+POINT_COLORS = ["#d0d0d0"] * 32
+for (_region_name, _region_members), _region_color in zip(REGIONS, REGION_COLORS):
+    for _region_number in _region_members:
+        POINT_COLORS[_region_number - 1] = _region_color
 # 鞋垫直接放在秤上、14～45 kg 稳住样本，按上面五个区里的点做非负拟合。空载底数取第一次近 0 kg 段。
 BASELINE = (
     210.47, 198.21, 199.51, 196.92, 196.70, 198.88, 200.01, 196.39,
@@ -330,7 +335,7 @@ class InsoleView(tk.Tk):
         self._rate_started = time.monotonic()
 
         self.keyword = tk.StringVar(value="SENINSOLE")
-        self._cells: list[tuple[int, int, int]] = []
+        self._cells: list[tuple[int, int, int, int]] = []
         self._shown: list[tuple[int | None, bool]] = [(None, False)] * 32
         self._status_shown = ""
         self._weight_shown = ""
@@ -403,12 +408,11 @@ class InsoleView(tk.Tk):
         )
         self.weight_label.pack(side="left")
         tk.Label(meter, text="kg", bg="#f7f7f7", fg="#666666", font=("Microsoft YaHei UI", 12)).pack(side="left", padx=(6, 0))
-        self.region_label = tk.Label(
-            side,
-            text="\n".join(f"{name} --" for name, _members in REGIONS),
-            anchor="w", justify="left", bg="#f7f7f7", fg="#333333",
-        )
-        self.region_label.pack(anchor="w", pady=(0, 8))
+        self._region_labels: list[tk.Label] = []
+        for (name, _members), color in zip(REGIONS, REGION_COLORS):
+            label = tk.Label(side, text=f"{name} --", anchor="w", bg="#f7f7f7", fg=color)
+            label.pack(anchor="w")
+            self._region_labels.append(label)
 
         tk.Label(side, text="脚尖在上", bg="#f7f7f7", fg="#888888").pack(anchor="w", pady=(8, 0))
         self.summary = tk.Label(
@@ -438,9 +442,14 @@ class InsoleView(tk.Tk):
         radius = FOOT_RADIUS
         for number, px, py in FOOT_POINTS:
             cx, cy = self._foot_xy(px, py)
+            color = POINT_COLORS[number - 1]
+            halo = self.canvas.create_oval(
+                cx - radius - 4, cy - radius - 4, cx + radius + 4, cy + radius + 4,
+                outline="#111111", width=2, state="hidden",
+            )
             oval = self.canvas.create_oval(
                 cx - radius, cy - radius, cx + radius, cy + radius,
-                fill="#f3f3f3", outline="#d0d0d0", width=2,
+                fill="#f3f3f3", outline=color, width=3,
             )
             name = self.canvas.create_text(
                 cx, cy - 7, text=str(number), font=("Microsoft YaHei UI", 8), fill="#9a9a9a",
@@ -448,7 +457,7 @@ class InsoleView(tk.Tk):
             value = self.canvas.create_text(
                 cx, cy + 8, text="--", font=("Consolas", 8, "bold"), fill="#9a9a9a",
             )
-            placed[number - 1] = (oval, name, value)
+            placed[number - 1] = (oval, name, value, halo)
         self._cells = placed
 
         scale = tk.Frame(body, bg="#f7f7f7", width=268)
@@ -803,18 +812,20 @@ class InsoleView(tk.Tk):
             )
         if region_text != self._region_shown:
             self._region_shown = region_text
-            self.region_label.configure(text=region_text)
+            for label, text in zip(self._region_labels, region_text.split("\n")):
+                label.configure(text=text)
         peak = None
         if values:
             peak = max(range(32), key=values.__getitem__)
-        for index, (rect, name, label) in enumerate(self._cells):
+        for index, (rect, name, label, halo) in enumerate(self._cells):
             value = None if values is None else values[index]
             is_peak = peak == index
             if self._shown[index] == (value, is_peak):
                 continue
             self._shown[index] = (value, is_peak)
             background, foreground = cell_colors(value)
-            self.canvas.itemconfig(rect, fill=background, outline="#1565c0" if is_peak else "#d0d0d0")
+            self.canvas.itemconfig(rect, fill=background, outline=POINT_COLORS[index])
+            self.canvas.itemconfig(halo, state="normal" if is_peak else "hidden")
             self.canvas.itemconfig(name, fill=foreground)
             self.canvas.itemconfig(label, text="--" if value is None else str(value), fill=foreground)
 
